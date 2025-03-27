@@ -1,0 +1,78 @@
+	-- DROP FUNCTION std10_44_1.f_load_partition(text, text, timestamp, text, text);
+
+CREATE OR REPLACE FUNCTION std10_44_1.f_load_partition(
+  tablename text,
+  ext_tablename text,
+  start_date timestamp,
+  partition_key text,
+  dataformat text DEFAULT NULL::text
+)
+	RETURNS int4
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+DECLARE 
+    cnt int;
+    temp_table text;
+    dist_key text;
+    params text;
+    v_table_oid int;
+    where_clause text;
+BEGIN
+    temp_table = tablename || '_temp';
+    SELECT c.oid
+    INTO v_table_oid
+    FROM pg_class AS c 
+    INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
+    WHERE n.nspname || '.' || c.relname = tablename
+    LIMIT 1;
+
+    IF v_table_oid = 0 OR v_table_oid IS NULL THEN
+        dist_key = 'DISTRBUTED RANDOMLY';
+    ELSE 
+        dist_key = pg_get_table_distributedby(v_table_oid);
+    END IF;
+
+    SELECT COALESCE('WITH (' || array_to_string(reloptions, ', ') || ')', ',')
+    FROM pg_class
+    INTO params
+    WHERE oid = tablename::regclass;
+	RAISE NOTICE '%', tablename;
+
+    -- Формирование условия фильтрации для даты с учетом нового аргумента dataformat, если dataformat не NULL
+    IF dataformat IS NOT NULL THEN
+        where_clause = 'to_date(' || partition_key || ', ' || quote_literal(dataformat) || ') >= date_trunc(''month'', timestamp ''' || start_date || ''')::date AND ' ||
+                   'to_date(' || partition_key || ', ' || quote_literal(dataformat) || ') < (date_trunc(''month'', timestamp ''' || start_date || ''') + INTERVAL ''1 month'')::date';
+    ELSE
+        -- Если dataformat NULL, просто сравниваем partition_key с датой без преобразования
+        where_clause = partition_key || ' >= date_trunc(''month'', timestamp ''' || start_date || ''')::date AND ' ||
+                   partition_key || ' < (date_trunc(''month'', timestamp ''' || start_date || ''') + INTERVAL ''1 month'')::date';
+    END IF;
+
+    RAISE NOTICE '%', where_clause;
+    EXECUTE 'DROP TABLE IF EXISTS ' || temp_table || '; CREATE TABLE ' || temp_table || ' (LIKE ' || tablename || ') ' || params || ' ' || dist_key || ';';
+    
+    RAISE NOTICE '%', 'Creation successful';
+    
+    EXECUTE 'INSERT INTO ' || temp_table || ' SELECT * FROM ' || ext_tablename || ' WHERE ' || where_clause;
+
+    RAISE NOTICE '%', 'Insertion successful';
+    
+    -- Преобразование столбца partition_key к типу данных date с учетом формата данных, если dataformat не NULL
+    IF dataformat IS NOT NULL THEN
+        EXECUTE 'ALTER TABLE ' || temp_table || ' ALTER COLUMN ' || partition_key || ' TYPE date USING to_date(' || partition_key || ', ' || quote_literal(dataformat) || ')';
+    	 
+    END IF;
+   
+	EXECUTE 'ALTER TABLE ' || tablename || ' EXCHANGE PARTITION FOR (DATE ''' || date_trunc('month', start_date) || ''') WITH TABLE ' || temp_table || ' WITH VALIDATION;';
+
+    EXECUTE 'SELECT COUNT(1) FROM ' || tablename INTO cnt;
+
+    EXECUTE 'DROP TABLE IF EXISTS ' || temp_table;
+
+    RETURN cnt;
+END
+
+$$
+EXECUTE ON ANY;
